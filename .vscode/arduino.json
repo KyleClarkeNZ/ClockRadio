@@ -1,0 +1,6 @@
+{
+  "sketch": "Clock Radio.ino",
+  "board": "arduino:avr:micro",
+  "port": "/dev/ttyACM1",
+  "output": ".build"
+}

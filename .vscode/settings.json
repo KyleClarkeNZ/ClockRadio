@@ -1,0 +1,8 @@
+{
+  "arduino.useArduinoCli": true,
+  "arduino.logLevel": "info",
+  "arduino.enableUSBDetection": true,
+  "files.exclude": {
+    ".build/": true
+  }
+}

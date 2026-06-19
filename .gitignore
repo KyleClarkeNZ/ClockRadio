@@ -1,0 +1,9 @@
+# Build output
+.build/
+
+# Arduino IDE build cache
+/tmp/arduino/
+
+# OS
+.DS_Store
+Thumbs.db
