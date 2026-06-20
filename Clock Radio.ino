@@ -5,14 +5,14 @@
 //   CJMCU-470 GND  -> Arduino GND
 //   CJMCU-470 SDA  -> Arduino SDA (pin 2 on Micro)
 //   CJMCU-470 SCL  -> Arduino SCL (pin 3 on Micro)
-//   CJMCU-470 RST  -> Arduino pin 5
+//   CJMCU-470 RST  -> Arduino pin 14
 //
 // Audio output is on the CJMCU-470 onboard 3.5mm headphone jack.
 
 #include <Wire.h>
 
 #define SI4703_ADDR   0x10
-#define SI4703_RST    5
+#define SI4703_RST    14
 
 // Target frequency in MHz (87.5–108.0, 0.1 MHz steps)
 #define TARGET_FREQ   91.8f
@@ -111,10 +111,10 @@ void setup() {
   Serial.println(F("[4] Configuring band & volume..."));
   readRegisters();
   regs[REG_SYSCONFIG1] = SYSCONFIG1_DE;        // 50µs de-emphasis (Europe)
-  // SEEKTH=0x00, BAND=00 (87.5–108 MHz), SPACE=01 (100 kHz), VOLUME=1111 (max)
-  regs[REG_SYSCONFIG2] = (0x00 << 8) | (0b00 << 6) | (0b01 << 4) | 0x0F;
+  // SEEKTH=0x00, BAND=00 (87.5–108 MHz), SPACE=01 (100 kHz), VOLUME=1000 (50%)
+  regs[REG_SYSCONFIG2] = (0x00 << 8) | (0b00 << 6) | (0b01 << 4) | 0x08;
   writeRegisters();
-  Serial.println(F("    Band: 87.5-108 MHz, Spacing: 100 kHz, Volume: 15/15"));
+  Serial.println(F("    Band: 87.5-108 MHz, Spacing: 100 kHz, Volume: 8/15 (50%)"));
 
   // ── Step 5: Tune to 91.8 MHz ──────────────────────────
   uint16_t channel = (uint16_t)(((TARGET_FREQ - 87.5f) / 0.1f) + 0.5f);  // = 43
@@ -167,7 +167,7 @@ void printResult() {
     Serial.print(F("  Frequency : ")); Serial.print(g_freq);  Serial.println(F(" MHz"));
     Serial.print(F("  RSSI      : ")); Serial.print(g_rssi);  Serial.println(F(" dBuV"));
     Serial.print(F("  Stereo    : ")); Serial.println(g_stereo ? F("Yes") : F("No (mono)"));
-    Serial.println(F("  Volume    : 15 / 15 (max)"));
+    Serial.println(F("  Volume    : 8 / 15 (50%)"));
   } else {
     Serial.println(F("  ERROR — Tune failed (check wiring) "));
   }
