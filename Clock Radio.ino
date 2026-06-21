@@ -70,6 +70,8 @@
 #define SYSCONFIG1_DE    0x0800  // De-emphasis: 1=50µs (Europe), 0=75µs (USA)
 
 #define LIGHTBLUE  0x5DDF        // light-blue from reference clock display
+#define LED_STEREO    8             // red LED: HIGH = stereo lock, LOW = mono/off
+#define LED_BACKLIGHT 10            // LED filament strip (PWM): brightness tracks volume
 
 uint16_t regs[16];
 
@@ -101,6 +103,7 @@ const float STATIONS[5] = { 88.6f, 91.8f, 94.2f, 97.8f, 99.0f };
 int  g_station      = 1;   // index into STATIONS (default 91.8)
 int  g_shownStation = -1;  // last station drawn
 int  g_shownMinute  = -1;  // last minute drawn
+int  g_shownSecond  = -1;  // last second drawn (drives colon blink)
 int  g_shownVol     = -1;  // last volume drawn
 int  g_volume       =  8;  // current Si4703 volume (0-15)
 int  g_volEma       =  0;  // EMA-filtered volume pot (0-1023); updated every loop tick
@@ -235,7 +238,11 @@ void setup() {
   // Prime the UI state machine and show the clock
   g_lastStationRaw = analogRead(STATION_POT);
   g_volEma         = analogRead(VOLUME_POT);  // prime EMA at actual pot position
-  // Set volume to whatever the pot is currently at (not a jarring fixed value)
+  // Configure LED pins before setVolume() so the first call sets them correctly
+  pinMode(LED_STEREO,    OUTPUT);
+  pinMode(LED_BACKLIGHT, OUTPUT);
+  // Set volume to whatever the pot is currently at (not a jarring fixed value);
+  // setVolume() will drive both LEDs to the right state immediately.
   uint8_t initVol = (uint8_t)computeVol(g_volEma);
   setVolume(initVol);
   Serial.print(F("    Volume set to pot position: ")); Serial.print(initVol); Serial.println(F("/15"));
@@ -300,32 +307,41 @@ int smoothRead(uint8_t pin) {
   return (int)(sum >> 3);
 }
 
-// ── Big curved value (clears band first so variable-width text is clean) ──
+// ── Big curved value drawn in place — no per-update clear, no flash ──────
+// curveDraw() uses an opaque black background on every glyph cell, so each
+// character overwrites its own pixels in place. No fillRect needed here;
+// the text band is cleared once in loop() on screen transitions (entering).
 void drawBigCurved(const char* s) {
-  tft.fillRect(0, 50, 320, 85, ST77XX_BLACK);
   curveDraw(s, 5, LIGHTBLUE, 60);
 }
 
-// ── Map pot reading to a station zone (5 zones) with anti-bounce hysteresis ─
+// ── Map pot reading to a station zone (5 zones) with log compensation ────────
+// A1 is a log/audio taper pot; sqrt() maps its response to a linear 0.0-1.0
+// position before zoning, so all 5 stations get equal physical rotation.
+// Hysteresis: must move 0.6 of a zone past the boundary to switch.
 int stationZone(int raw, int cur) {
-  const int zoneW  = 1024 / 5;   // ~204 counts per zone
-  const int margin = 30;         // must clear boundary by this much to switch
-  int z = raw / zoneW;
+  float pos = sqrtf((float)constrain(raw, 0, 1023) / 1023.0f) * 5.0f; // 0.0-5.0
+  int z = (int)pos;
   if (z > 4) z = 4;
   if (z == cur) return cur;
-  int boundary = (z > cur ? z : cur) * zoneW;
-  if (abs(raw - boundary) >= margin) return z;
-  return cur;                     // inside dead-band — hold current zone
+  // Only commit to new zone if we're 0.6 zone-widths clear of the boundary
+  float boundary = (float)(z > cur ? z : cur);  // the shared edge between zones
+  if (fabsf(pos - boundary) >= 0.6f) return z;
+  return cur;
 }
 
-// ── Screen: Clock (HH:MM) ─────────────────────────────────────────────
+// ── Screen: Clock (12-hour HH:MM, zero-padded) ─────────────────────────
 void screenClock(bool entering) {
   if (!g_rtc_ok) return;
   DateTime now = rtc.now();
-  if (entering || now.minute() != g_shownMinute) {
-    g_shownMinute = now.minute();
+  int min = now.minute();
+  int h12 = now.hour() % 12;
+  if (h12 == 0) h12 = 12;
+
+  if (entering || min != g_shownMinute) {
+    g_shownMinute = min;
     char buf[6];
-    sprintf(buf, "%02d:%02d", now.hour(), now.minute());
+    sprintf(buf, "%02d:%02d", h12, min);
     drawBigCurved(buf);
   }
 }
@@ -353,6 +369,8 @@ void setVolume(uint8_t vol) {
   regs[REG_SYSCONFIG2] = (regs[REG_SYSCONFIG2] & 0xFFF0) | vol;
   writeRegisters();
   g_volume = vol;
+  analogWrite(LED_BACKLIGHT, vol * 17);            // 0-15 -> 0-255 PWM
+  digitalWrite(LED_STEREO, vol > 0 ? HIGH : LOW);  // on when audio active
 }
 
 // ── Compute volume level (0-15) from raw ADC; dead zones + log compensation ──
@@ -370,7 +388,7 @@ void screenVolume(bool entering, int raw) {
     g_shownVol = vol;
     setVolume((uint8_t)vol);
     char buf[8];
-    sprintf(buf, "%d/15", vol);
+    sprintf(buf, "%2d/15", vol);   // always 5 chars — fixed width avoids yOff mismatch
     drawBigCurved(buf);
     Serial.print(F("Volume -> ")); Serial.print(vol); Serial.println(F("/15"));
   }
@@ -418,11 +436,16 @@ void loop() {
     g_uiState = UI_CLOCK;
   }
 
-  // ── On screen change: clear once and reset the "last shown" trackers ────
+  // ── On screen change: clear the text band once, then force a full redraw. ──
+  // Clearing only on entering (not per-update) means minute ticks / volume
+  // steps / station changes never blank anything — they overwrite in place.
+  // The one-time band clear on entering removes vertical top-of-cell remnants
+  // that linger when an old char at a given x started higher (smaller yOff)
+  // than the new char at the same x range.
   bool entering = (g_uiState != g_prevState);
   if (entering) {
-    tft.fillScreen(ST77XX_BLACK);
-    g_shownMinute = g_shownStation = g_shownVol = -1;
+    tft.fillRect(0, 50, 320, 85, ST77XX_BLACK);   // clear text band only
+    g_shownMinute = g_shownStation = g_shownVol = g_shownSecond = -1;
     g_prevState = g_uiState;
   }
 
