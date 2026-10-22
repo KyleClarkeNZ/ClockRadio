@@ -1,4 +1,4 @@
-// CJMCU-470 (Si4703) FM Radio - Tune to 91.8 MHz  +  ST7789 170x320 display
+// CJMCU-470 (Si4703) FM Clock Radio  +  ST7789 170x320 display  +  DS3231 RTC
 //
 // Wiring - Si4703:
 //   CJMCU-470 VCC  -> Arduino 3.3V
@@ -38,9 +38,6 @@
 #define TFT_CS    6
 #define TFT_DC    5
 #define TFT_RST   4
-
-// Target frequency in MHz (87.5–108.0, 0.1 MHz steps)
-#define TARGET_FREQ   91.8f
 
 // Register addresses
 #define REG_POWERCFG   0x02
@@ -98,12 +95,12 @@ const unsigned long IDLE_TIMEOUT = 3000;     // ms of stillness -> back to clock
 const int POT_MOVE_THRESH = 8;
 int  g_lastStationRaw = 0;
 
-// Top 5 Auckland FM stations (MHz)
-const float STATIONS[5] = { 88.6f, 91.8f, 94.2f, 97.8f, 99.0f };
-int  g_station      = 1;   // index into STATIONS (default 91.8)
+// Auckland FM stations (MHz) — add or remove freely; the knob zones follow
+const float STATIONS[] = { 88.6f, 90.2f, 91.8f, 94.2f, 95.0f, 99.0f };   // ascending = CCW to CW
+const int   NUM_STATIONS = sizeof(STATIONS) / sizeof(STATIONS[0]);
+int  g_station      = 0;   // index into STATIONS (set from the knob at boot)
 int  g_shownStation = -1;  // last station drawn
 int  g_shownMinute  = -1;  // last minute drawn
-int  g_shownSecond  = -1;  // last second drawn (drives colon blink)
 int  g_shownVol     = -1;  // last volume drawn
 int  g_volume       =  8;  // current Si4703 volume (0-15)
 int  g_volEma       =  0;  // EMA-filtered volume pot (0-1023); updated every loop tick
@@ -124,13 +121,20 @@ static bool isNewUpload() {
   return false;
 }
 
-// Si4703 reads always start at register 0x0A and wrap to 0x00
-void readRegisters() {
-  Wire.requestFrom((uint8_t)SI4703_ADDR, (uint8_t)32);
+// Si4703 reads always start at register 0x0A and wrap to 0x00.
+// A short read (I2C timeout/glitch) leaves regs[] at its last good values —
+// otherwise Wire.read()'s -1 would fill it with 0xFFFF, and the next
+// writeRegisters() would send that garbage to the chip (power-down, seek...).
+bool readRegisters() {
+  if (Wire.requestFrom((uint8_t)SI4703_ADDR, (uint8_t)32) != 32) {
+    while (Wire.available()) Wire.read();   // discard the partial read
+    return false;
+  }
   for (int i = 0x0A; i <= 0x0F; i++)
     regs[i] = ((uint16_t)Wire.read() << 8) | Wire.read();
   for (int i = 0x00; i <= 0x09; i++)
     regs[i] = ((uint16_t)Wire.read() << 8) | Wire.read();
+  return true;
 }
 
 // Si4703 writes always start at register 0x02
@@ -193,7 +197,7 @@ void setup() {
   }
 
   Serial.println(F("====================================="));
-  Serial.println(F("  Si4703 FM Radio — Tuning to 91.8  "));
+  Serial.println(F("  Si4703 FM Clock Radio             "));
   Serial.println(F("====================================="));
   Serial.println();
 
@@ -206,7 +210,7 @@ void setup() {
   // ── Step 2: Enable crystal oscillator ─────────────────
   Serial.println(F("[2] Starting crystal oscillator..."));
   readRegisters();
-  regs[REG_TEST1] = 0x8100;  // XOSCEN + reserved bit 8 (required by AN332)
+  regs[REG_TEST1] = TEST1_XOSCEN | 0x0100;  // + reserved bit 8 (required by AN332)
   writeRegisters();
   delay(500);
   Serial.println(F("    Done."));
@@ -227,17 +231,30 @@ void setup() {
   writeRegisters();
   Serial.println(F("    Band: 87.5-108 MHz, Spacing: 100 kHz, Volume: 0 (muted at boot)"));
 
-  // ── Step 5: Tune to default station (91.8) ────────────────────────
-  g_station = 1;
+  // ── Step 5: Tune to the station the knob is pointing at ─────────────
+  // smoothRead() (not analogRead) so the high-Z pots settle before priming.
+  g_lastStationRaw = smoothRead(STATION_POT);
+  g_volEma         = smoothRead(VOLUME_POT);
+  g_station = stationZoneRaw(g_lastStationRaw);
   Serial.print(F("[5] Tuning to ")); Serial.print(STATIONS[g_station]); Serial.println(F(" MHz..."));
   g_ok = tuneTo(STATIONS[g_station]);
   Serial.println(g_ok ? F("    Tuned.") : F("    Tune failed!"));
 
   printResult();
 
-  // Prime the UI state machine and show the clock
-  g_lastStationRaw = analogRead(STATION_POT);
-  g_volEma         = analogRead(VOLUME_POT);  // prime EMA at actual pot position
+#ifdef BAND_SCAN
+  // Debug: tune every 100 kHz channel and print RSSI, then return to the station
+  while (!Serial && millis() < 15000);   // wait for the serial monitor to attach
+  Serial.println(F("SCAN freq rssi stereo"));
+  for (int ch = 0; ch <= 205; ch++) {
+    tuneTo(87.5f + ch * 0.1f);
+    Serial.print(F("SCAN ")); Serial.print(g_freq, 1); Serial.print(' ');
+    Serial.print(g_rssi); Serial.print(' '); Serial.println(g_stereo ? 1 : 0);
+  }
+  Serial.println(F("SCAN done"));
+  g_ok = tuneTo(STATIONS[g_station]);
+#endif
+
   // Configure LED pins before setVolume() so the first call sets them correctly
   pinMode(LED_STEREO,    OUTPUT);
   pinMode(LED_BACKLIGHT, OUTPUT);
@@ -296,7 +313,28 @@ bool tuneTo(float freqMHz) {
 // sample/hold cap can't settle — and it still holds charge from the previously
 // muxed channel. Fix: select the channel with a throwaway read, pause to let the
 // cap charge through the high resistance, THEN average several real samples.
-int smoothRead(uint8_t pin) {
+// Also: the pots' wipers go open-circuit at the end stops (and at full CW when
+// the knob is pressed), so the pin floats and reads whatever charge the cap last
+// held. To detect that, the pin is read twice: once after pre-charging the cap
+// from the internal 0V channel, once from the 1.1V bandgap. A connected wiper
+// drives both to the same value; a floating pin follows the pre-charge, so the
+// reads disagree and the last good value is returned instead.
+#define ADC_MUX_BANDGAP 0x1E   // 1.1V reference
+#define ADC_MUX_GND     0x1F   // 0V
+const int FLOAT_THRESH = 40;   // counts of disagreement that mean "floating"
+int g_floatDiff = 0;           // last disagreement seen (for POT_DEBUG)
+
+static void adcPrecharge(uint8_t mux) {
+  ADMUX  = _BV(REFS0) | mux;           // AVcc ref + internal channel
+  ADCSRB &= ~_BV(MUX5);
+  for (uint8_t i = 0; i < 2; i++) {    // 2 conversions: bandgap needs to settle
+    ADCSRA |= _BV(ADSC);
+    while (ADCSRA & _BV(ADSC));
+  }
+}
+
+static int settledRead(uint8_t pin, uint8_t prechargeMux) {
+  adcPrecharge(prechargeMux);
   analogRead(pin);            // dummy read — selects channel, starts cap charging
   delayMicroseconds(300);    // settle time for the high-Z source
   long sum = 0;
@@ -307,6 +345,50 @@ int smoothRead(uint8_t pin) {
   return (int)(sum >> 3);
 }
 
+// Some floating reads still agree by chance (mains hum drives the open pin), so
+// two more guards: after any floating read the pot is ignored for FLOAT_LOCKOUT
+// ms, and a jump bigger than MAX_STEP is only accepted once JUMP_CONFIRM reads
+// in a row agree with each other — a real turn moves smoothly, a lifted wiper
+// jumps straight from ~1017 to a few hundred.
+const unsigned long FLOAT_LOCKOUT = 250;
+const int MAX_STEP     = 80;
+const uint8_t JUMP_CONFIRM = 3;
+
+int smoothRead(uint8_t pin) {
+  // Per-pot state, indexed by pin - A0 (A0 / A1)
+  static int           lastGood[2]  = { -1, -1 };   // -1 = not primed yet
+  static int           prevSample[2];
+  static uint8_t       runCount[2];
+  static unsigned long floatUntil[2];
+  int idx = (pin - A0) & 1;
+
+  int lo = settledRead(pin, ADC_MUX_GND);
+  int hi = settledRead(pin, ADC_MUX_BANDGAP);
+  if (pin == VOLUME_POT) g_floatDiff = hi - lo;
+  unsigned long now = millis();
+  if (abs(hi - lo) > FLOAT_THRESH) {                 // wiper open — hold
+    floatUntil[idx] = now + FLOAT_LOCKOUT;
+    runCount[idx]   = 0;
+    return max(lastGood[idx], 0);
+  }
+  if ((long)(now - floatUntil[idx]) < 0) return max(lastGood[idx], 0);
+
+  int v = (lo + hi) >> 1;
+  if (lastGood[idx] < 0 || abs(v - lastGood[idx]) <= MAX_STEP) {
+    lastGood[idx] = v;
+    runCount[idx] = 0;
+  } else if (abs(v - prevSample[idx]) <= MAX_STEP) {
+    if (++runCount[idx] >= JUMP_CONFIRM - 1) {      // this read + the run before it
+      lastGood[idx] = v;
+      runCount[idx] = 0;
+    }
+  } else {
+    runCount[idx] = 0;
+  }
+  prevSample[idx] = v;
+  return lastGood[idx];
+}
+
 // ── Big curved value drawn in place — no per-update clear, no flash ──────
 // curveDraw() uses an opaque black background on every glyph cell, so each
 // character overwrites its own pixels in place. No fillRect needed here;
@@ -315,18 +397,28 @@ void drawBigCurved(const char* s) {
   curveDraw(s, 5, LIGHTBLUE, 60);
 }
 
-// ── Map pot reading to a station zone (5 zones) with log compensation ────────
+// ── Map pot reading to a station zone (one per station) with log compensation ─
 // A1 is a log/audio taper pot; sqrt() maps its response to a linear 0.0-1.0
-// position before zoning, so all 5 stations get equal physical rotation.
-// Hysteresis: must move 0.6 of a zone past the boundary to switch.
+// position before zoning, so every station gets equal physical rotation.
+// Hysteresis: must move 0.2 of a zone past the boundary to switch.
+static float stationPos(int raw) {
+  return sqrtf((float)constrain(raw, 0, 1023) / 1023.0f) * NUM_STATIONS;  // 0.0-NUM_STATIONS
+}
+
+// Zone with no hysteresis — used at boot when there is no current station
+int stationZoneRaw(int raw) {
+  int z = (int)stationPos(raw);
+  return z > NUM_STATIONS - 1 ? NUM_STATIONS - 1 : z;
+}
+
 int stationZone(int raw, int cur) {
-  float pos = sqrtf((float)constrain(raw, 0, 1023) / 1023.0f) * 5.0f; // 0.0-5.0
-  int z = (int)pos;
-  if (z > 4) z = 4;
+  float pos = stationPos(raw);
+  int z = stationZoneRaw(raw);
   if (z == cur) return cur;
-  // Only commit to new zone if we're 0.6 zone-widths clear of the boundary
+  if (abs(z - cur) > 1) return z;               // big jump — clearly intentional
+  // Only commit to new zone if we're 0.2 zone-widths clear of the boundary
   float boundary = (float)(z > cur ? z : cur);  // the shared edge between zones
-  if (fabsf(pos - boundary) >= 0.6f) return z;
+  if (fabsf(pos - boundary) >= 0.2f) return z;
   return cur;
 }
 
@@ -346,19 +438,16 @@ void screenClock(bool entering) {
   }
 }
 
-// ── Screen: Station selector (frequency) ─────────────────────────────
-void screenStation(bool entering, int raw) {
-  int z = stationZone(raw, g_station);
+// ── Screen: Station selector (frequency) — display only; loop() tunes ────
+void screenStation(bool entering) {
+  int z = g_station;
   if (entering || z != g_shownStation) {
-    g_station      = z;
     g_shownStation = z;
-    tuneTo(STATIONS[z]);
     int whole = (int)STATIONS[z];
     int frac  = (int)(STATIONS[z] * 10.0f + 0.5f) % 10;
     char buf[10];
     sprintf(buf, "%d.%dFM", whole, frac);
     drawBigCurved(buf);
-    Serial.print(F("Station -> ")); Serial.print(STATIONS[z]); Serial.println(F(" MHz"));
   }
 }
 
@@ -373,24 +462,34 @@ void setVolume(uint8_t vol) {
   digitalWrite(LED_STEREO, vol > 0 ? HIGH : LOW);  // on when audio active
 }
 
-// ── Compute volume level (0-15) from raw ADC; dead zones + log compensation ──
+// ── Compute volume level (0-15) from raw ADC: linear, 16 equal-width bands ──
+// Ends measured on the real pot: CCW end floats 0-100 (mains hum), CW ~1016-1020.
+const int VOL_RAW_MIN = 110;   // at or below -> 0 (mute); floating CCW end hums 0-100
+const int VOL_RAW_MAX = 990;   // at or above -> 15
 int computeVol(int raw) {
-  if (raw < 72)   return 0;   // ~7% dead zone at bottom
-  if (raw > 972)  return 15;
-  int v = (int)(sqrtf((float)(raw - 72) / 900.0f) * 15.0f + 0.5f);
-  return constrain(v, 0, 15);
+  if (raw <= VOL_RAW_MIN) return 0;
+  if (raw >= VOL_RAW_MAX) return 15;
+  return 1 + (long)(raw - VOL_RAW_MIN) * 14 / (VOL_RAW_MAX - VOL_RAW_MIN);
 }
 
-// ── Screen: Volume ────────────────────────────────────────────────────────
-void screenVolume(bool entering, int raw) {
-  int vol = computeVol(raw);
+// ── Volume level with hysteresis: the pot must move VOL_HYST counts past a
+// step edge before the level changes, so noise near an edge can't flicker it.
+const int VOL_HYST = 8;
+int volumeLevel(int raw, int cur) {
+  int v = computeVol(raw);
+  if (v > cur && computeVol(raw - VOL_HYST) > cur) return v;
+  if (v < cur && computeVol(raw + VOL_HYST) < cur) return v;
+  return cur;
+}
+
+// ── Screen: Volume — display only; loop() applies the volume ─────────────
+void screenVolume(bool entering) {
+  int vol = g_volume;
   if (entering || vol != g_shownVol) {
     g_shownVol = vol;
-    setVolume((uint8_t)vol);
     char buf[8];
     sprintf(buf, "%2d/15", vol);   // always 5 chars — fixed width avoids yOff mismatch
     drawBigCurved(buf);
-    Serial.print(F("Volume -> ")); Serial.print(vol); Serial.println(F("/15"));
   }
 }
 
@@ -402,7 +501,6 @@ void printResult() {
     Serial.print(F("  Frequency : ")); Serial.print(g_freq);  Serial.println(F(" MHz"));
     Serial.print(F("  RSSI      : ")); Serial.print(g_rssi);  Serial.println(F(" dBuV"));
     Serial.print(F("  Stereo    : ")); Serial.println(g_stereo ? F("Yes") : F("No (mono)"));
-    Serial.println(F("  Volume    : 8 / 15 (50%)"));
   } else {
     Serial.println(F("  ERROR — Tune failed (check wiring) "));
   }
@@ -416,18 +514,43 @@ void loop() {
   // EMA low-pass filter on the volume pot. smoothRead() already does a settling
   // dummy read so the high-Z pot value is clean before it feeds the filter.
   int volumeRaw = smoothRead(VOLUME_POT);
-  g_volEma = (g_volEma * 7 + volumeRaw) >> 3;
+  g_volEma = (g_volEma * 7 + volumeRaw + 4) >> 3;   // +4 rounds to nearest
 
-  // ── Detect pot movement → switch screen + reset idle timer ──────────────
+#ifdef POT_DEBUG
+  static unsigned long lastDbg = 0;
+  if (nowMs - lastDbg > 200) {
+    lastDbg = nowMs;
+    Serial.print(F("DBG volRaw=")); Serial.print(volumeRaw);
+    Serial.print(F(" ema="));       Serial.print(g_volEma);
+    Serial.print(F(" lvl="));       Serial.print(g_volume);
+    Serial.print(F(" diff="));      Serial.println(g_floatDiff);
+  }
+#endif
+
+  // ── Apply knob changes regardless of which screen is showing ────────────
+  // Tuning/volume live here (not in the screen functions) so a change is never
+  // lost when both knobs move at once, and redrawing a screen never re-tunes.
+  int z = stationZone(stationRaw, g_station);
+  if (z != g_station) {
+    g_station = z;
+    tuneTo(STATIONS[z]);
+    Serial.print(F("Station -> ")); Serial.print(STATIONS[z]); Serial.println(F(" MHz"));
+    g_uiState      = UI_STATION;
+    nowMs          = millis();   // tuneTo() can block — refresh so the idle check
+    g_lastActivity = nowMs;      // below can't see lastActivity > nowMs and wrap
+  }
+  int vol = volumeLevel(g_volEma, g_volume);
+  if (vol != g_volume) {
+    setVolume((uint8_t)vol);
+    Serial.print(F("Volume -> ")); Serial.print(vol); Serial.println(F("/15"));
+    g_uiState      = UI_VOLUME;
+    g_lastActivity = nowMs;
+  }
+
+  // ── Knob touched without changing station → show/hold the station screen ─
   if (abs(stationRaw - g_lastStationRaw) > POT_MOVE_THRESH) {
     g_lastStationRaw = stationRaw;
-    g_uiState        = UI_STATION;
-    g_lastActivity   = nowMs;
-  }
-  // Only switch to volume screen if the computed level has actually changed —
-  // this prevents dead-zone jitter near raw=0 from triggering a spurious switch.
-  if (computeVol(g_volEma) != g_volume) {
-    g_uiState      = UI_VOLUME;
+    if (g_uiState != UI_VOLUME) g_uiState = UI_STATION;
     g_lastActivity = nowMs;
   }
 
@@ -445,14 +568,14 @@ void loop() {
   bool entering = (g_uiState != g_prevState);
   if (entering) {
     tft.fillRect(0, 50, 320, 85, ST77XX_BLACK);   // clear text band only
-    g_shownMinute = g_shownStation = g_shownVol = g_shownSecond = -1;
+    g_shownMinute = g_shownStation = g_shownVol = -1;
     g_prevState = g_uiState;
   }
 
   switch (g_uiState) {
     case UI_CLOCK:   screenClock(entering);              break;
-    case UI_STATION: screenStation(entering, stationRaw); break;
-    case UI_VOLUME:  screenVolume(entering, g_volEma);   break;
+    case UI_STATION: screenStation(entering); break;
+    case UI_VOLUME:  screenVolume(entering);  break;
   }
 
   delay(25);
